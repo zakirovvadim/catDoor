@@ -9,7 +9,7 @@ import threading, queue, subprocess, shutil
 # ==== ПАРАМЕТРЫ ====
 PIR_GPIO = 4
 LED_PINS = [17, 27, 22]      # [red, blue, green]
-BASE_DIR = Path("/home/pi/camera")
+BASE_DIR = Path.home() / "camera"
 TMP_DIR = BASE_DIR / "tmp"
 CATS_DIR = BASE_DIR / "cats"
 NOT_CAT_DIR = BASE_DIR / "not_cat"
@@ -41,8 +41,8 @@ def blink(led, times=2, ms=120):
 
 # ==== YOLOv4-tiny (OpenCV DNN) ====
 import cv2, numpy as np
-YOLO_CFG     = "/home/pi/models/yolo-tiny/yolov4-tiny.cfg"
-YOLO_WEIGHTS = "/home/pi/models/yolo-tiny/yolov4-tiny.weights"
+YOLO_CFG     = str(Path.home() / "models/yolo-tiny/yolov4-tiny.cfg")
+YOLO_WEIGHTS = str(Path.home() / "models/yolo-tiny/yolov4-tiny.weights")
 CONF_THRES = 0.25            # можно 0.20–0.35
 NMS_THRES  = 0.45
 INPUT_SIZE = 416             # 320 быстрее, 608 точнее
@@ -142,18 +142,37 @@ def enqueue_motion():
     except queue.Full:
         pass
 
-def capture_with_libcamera(dst_path: Path):
+def capture_with_camera(dst_path: Path, rotation=0):
+    """
+    Снимает кадр через доступную утилиту:
+    rpicam-still -> libcamera-still -> libcamera-jpeg
+    """
+    # выберем доступную команду
+    cmd = None
+    for c in ("rpicam-still", "libcamera-still", "libcamera-jpeg"):
+        if shutil.which(c):
+            cmd = c
+            break
+    if not cmd:
+        raise FileNotFoundError("Нет rpicam-still/libcamera-still/libcamera-jpeg. Установи: sudo apt install -y rpicam-apps || libcamera-apps")
+
     w, h = PHOTO_RES.split("x")
-    cmd = ["libcamera-jpeg", "-n", "--immediate", "--width", w, "--height", h, "-o", str(dst_path)]
+    args = [cmd, "-n", "--immediate", "--width", w, "--height", h, "-o", str(dst_path)]
+    if rotation:
+        # оба CLI понимают --rotation
+        args[1:1] = ["--rotation", str(rotation)]
+
+    # повторы при сбое
     for attempt in range(1, CAPTURE_RETRIES + 2):
         try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
             return
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, FileNotFoundError):
             if attempt <= CAPTURE_RETRIES:
                 sleep(RETRY_DELAY)
             else:
                 raise
+
 
 def worker():
     while True:
@@ -164,7 +183,7 @@ def worker():
             ts = now.strftime("%d.%m.%Y_%H-%M-%S.") + f"{int(now.microsecond / 1000):03d}"
             tmp_path = TMP_DIR / f"motion_{ts}.jpg"
 
-            capture_with_libcamera(tmp_path)
+            capture_with_camera(tmp_path)
             print(f"[shot] saved: {tmp_path}")
 
             is_cat, best, yolo_lines = detect_is_cat_cv(str(tmp_path))
