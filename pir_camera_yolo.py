@@ -34,7 +34,7 @@ import cv2, numpy as np
 PIR_GPIO = int(os.getenv("PIR_GPIO", "4"))
 LED_PINS = [int(x) for x in os.getenv("LED_PINS", "17,27,22").split(",")]  # [red, blue, green]
 
-BASE_DIR = Path(os.getenv("BASE_DIR", "/home/vgzakirov/camera"))
+BASE_DIR = Path(os.getenv("BASE_DIR", "/home/pi/camera"))
 TMP_DIR = BASE_DIR / "tmp"
 CATS_DIR = BASE_DIR / "cats"
 NOT_CAT_DIR = BASE_DIR / "not_cat"
@@ -50,8 +50,16 @@ RETRY_DELAY = float(os.getenv("RETRY_DELAY", "0.4"))
 # Доступные плейсхолдеры: {ts} — YYYY-MM-DD_HH-mm-ss.SSS, {kind} — cats|not_cat, {conf} — 0.00
 NAME_TEMPLATE = os.getenv("NAME_TEMPLATE", "{ts}")
 
+# ==== Миниатюры (thumbnails) ====
+THUMBS_DIR = BASE_DIR / "thumbs"
+THUMBS_CATS_DIR = THUMBS_DIR / "cats"
+THUMBS_NOTCAT_DIR = THUMBS_DIR / "not_cat"
+THUMB_MAX_EDGE = int(os.getenv("THUMB_MAX_EDGE", "512"))  # максимальная сторона в пикселях
+THUMB_QUALITY = int(os.getenv("THUMB_QUALITY", "85"))     # jpeg качество 1..100
+MINIO_BUCKET_THUMBS = os.getenv("MINIO_BUCKET_THUMBS", "").strip()  # если пусто, используем MINIO_BUCKET_PHOTOS
+
 # ===== Папки (создадим, если нет) =====
-for d in [BASE_DIR, TMP_DIR, CATS_DIR, NOT_CAT_DIR]:
+for d in [BASE_DIR, TMP_DIR, CATS_DIR, NOT_CAT_DIR, THUMBS_DIR, THUMBS_CATS_DIR, THUMBS_NOTCAT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ===== PIR + LEDs =====
@@ -76,8 +84,8 @@ def blink(led: LED, times: int = 2, ms: int = 120):
 
 
 # ===== YOLOv4-tiny (OpenCV DNN) =====
-YOLO_CFG = os.getenv("YOLO_CFG", "/home/vgzakirov/models/yolo-tiny/yolov4-tiny.cfg")
-YOLO_WEIGHTS = os.getenv("YOLO_WEIGHTS", "/home/vgzakirov/models/yolo-tiny/yolov4-tiny.weights")
+YOLO_CFG = os.getenv("YOLO_CFG", "/home/pi/models/yolo-tiny/yolov4-tiny.cfg")
+YOLO_WEIGHTS = os.getenv("YOLO_WEIGHTS", "/home/pi/models/yolo-tiny/yolov4-tiny.weights")
 CONF_THRES = float(os.getenv("CONF_THRES", "0.25"))
 NMS_THRES = float(os.getenv("NMS_THRES", "0.45"))
 INPUT_SIZE = int(os.getenv("INPUT_SIZE", "416"))
@@ -229,6 +237,31 @@ def minio_object_paths(kind: str, basename: str) -> tuple[str, str]:
     label_key = _minio_object_name(f"labels/{kind}", f"{basename}.txt")
     return photo_key, label_key
 
+def minio_thumb_path(kind: str, basename: str) -> str:
+    return _minio_object_name(f"thumbs/{kind}", f"{basename}.jpg")
+
+
+# ==== Thumbnails utils ====
+def create_thumbnail(src: Path, dst: Path, max_edge: int = THUMB_MAX_EDGE, quality: int = THUMB_QUALITY):
+    try:
+        img = cv2.imread(str(src))
+        if img is None:
+            print(f"[thumb] cannot read {src}")
+            return
+        h, w = img.shape[:2]
+        m = max(h, w)
+        if m <= max_edge:
+            resized = img
+        else:
+            scale = max_edge / float(m)
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(dst), resized, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+        print(f"[thumb] saved: {dst}")
+    except Exception as e:
+        print(f"[thumb] error: {e}")
 
 # ===== Очередь событий/воркер =====
 work_q: "queue.Queue[bool]" = queue.Queue(maxsize=1)
@@ -310,6 +343,11 @@ def worker():
                 upload_minio(dst, MINIO_BUCKET_PHOTOS, photo_key, content_type="image/jpeg")
                 if yolo_lines:
                     upload_minio(label_path, MINIO_BUCKET_LABELS, label_key, content_type="text/plain")
+                # Thumbnail (локально + MinIO)
+                thumb_dst = THUMBS_CATS_DIR / f"{basename}.jpg"
+                create_thumbnail(dst, thumb_dst)
+                thumb_key = minio_thumb_path(kind, basename)
+                upload_minio(thumb_dst, (MINIO_BUCKET_THUMBS or MINIO_BUCKET_PHOTOS), thumb_key, content_type="image/jpeg")
 
                 blink(green_led, times=3)
                 print(f"[save] cat -> {dst.name} (minio: {photo_key})")
@@ -322,6 +360,11 @@ def worker():
                 # MinIO (у not_cat меток нет)
                 photo_key, _ = minio_object_paths(kind, basename)
                 upload_minio(dst, MINIO_BUCKET_PHOTOS, photo_key, content_type="image/jpeg")
+                # Thumbnail (локально + MinIO)
+                thumb_dst = THUMBS_NOTCAT_DIR / f"{basename}.jpg"
+                create_thumbnail(dst, thumb_dst)
+                thumb_key = minio_thumb_path(kind, basename)
+                upload_minio(thumb_dst, (MINIO_BUCKET_THUMBS or MINIO_BUCKET_PHOTOS), thumb_key, content_type="image/jpeg")
 
                 blink(red_led, times=3)
                 print(f"[save] not_cat -> {dst.name} (minio: {photo_key})")
