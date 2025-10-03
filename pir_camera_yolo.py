@@ -56,7 +56,7 @@ THUMBS_CATS_DIR = THUMBS_DIR / "cats"
 THUMBS_NOTCAT_DIR = THUMBS_DIR / "not_cat"
 THUMB_MAX_EDGE = int(os.getenv("THUMB_MAX_EDGE", "512"))  # максимальная сторона в пикселях
 THUMB_QUALITY = int(os.getenv("THUMB_QUALITY", "85"))     # jpeg качество 1..100
-MINIO_BUCKET_THUMBS = os.getenv("MINIO_BUCKET_THUMBS", "").strip()  # если пусто, используем MINIO_BUCKET_PHOTOS
+MINIO_BUCKET_THUMBS = os.getenv("MINIO_BUCKET_THUMBS", "thumbs").strip()  # если пусто, используем MINIO_BUCKET_PHOTOS
 
 # ===== Папки (создадим, если нет) =====
 for d in [BASE_DIR, TMP_DIR, CATS_DIR, NOT_CAT_DIR, THUMBS_DIR, THUMBS_CATS_DIR, THUMBS_NOTCAT_DIR]:
@@ -165,12 +165,12 @@ def detect_is_cat_cv(img_path: str) -> Tuple[bool, float, List[str]]:
 
 
 # ===== MinIO интеграция =====
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "").strip()        # например: 127.0.0.1:9000
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "").strip()
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "").strip()
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "127.0.0.1:9000").strip()        # например: 127.0.0.1:9000
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin").strip()
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin").strip()
 MINIO_SECURE = bool(int(os.getenv("MINIO_SECURE", "0")))        # 0 или 1
-MINIO_BUCKET_PHOTOS = os.getenv("MINIO_BUCKET_PHOTOS", "cat-photos")
-MINIO_BUCKET_LABELS = os.getenv("MINIO_BUCKET_LABELS", "cat-labels")
+MINIO_BUCKET_PHOTOS = os.getenv("MINIO_BUCKET_PHOTOS", "photo")
+MINIO_BUCKET_LABELS = os.getenv("MINIO_BUCKET_LABELS", "coordination")
 MINIO_PREFIX = os.getenv("MINIO_PREFIX", "").strip().strip("/")  # напр. "pi1"
 
 MINIO_ENABLED = all([MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY])
