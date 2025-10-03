@@ -34,7 +34,7 @@ import cv2, numpy as np
 PIR_GPIO = int(os.getenv("PIR_GPIO", "4"))
 LED_PINS = [int(x) for x in os.getenv("LED_PINS", "17,27,22").split(",")]  # [red, blue, green]
 
-BASE_DIR = Path(os.getenv("BASE_DIR", "/home/pi/camera"))
+BASE_DIR = Path(os.getenv("BASE_DIR", "/home/vgzakirov/camera"))
 TMP_DIR = BASE_DIR / "tmp"
 CATS_DIR = BASE_DIR / "cats"
 NOT_CAT_DIR = BASE_DIR / "not_cat"
@@ -76,8 +76,8 @@ def blink(led: LED, times: int = 2, ms: int = 120):
 
 
 # ===== YOLOv4-tiny (OpenCV DNN) =====
-YOLO_CFG = os.getenv("YOLO_CFG", "/home/pi/models/yolo-tiny/yolov4-tiny.cfg")
-YOLO_WEIGHTS = os.getenv("YOLO_WEIGHTS", "/home/pi/models/yolo-tiny/yolov4-tiny.weights")
+YOLO_CFG = os.getenv("YOLO_CFG", "/home/vgzakirov/models/yolo-tiny/yolov4-tiny.cfg")
+YOLO_WEIGHTS = os.getenv("YOLO_WEIGHTS", "/home/vgzakirov/models/yolo-tiny/yolov4-tiny.weights")
 CONF_THRES = float(os.getenv("CONF_THRES", "0.25"))
 NMS_THRES = float(os.getenv("NMS_THRES", "0.45"))
 INPUT_SIZE = int(os.getenv("INPUT_SIZE", "416"))
