@@ -4,9 +4,9 @@
 from gpiozero import MotionSensor, LED
 from signal import pause
 from time import sleep, monotonic
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-import threading, queue, subprocess, shutil, os, urllib.parse
+import threading, queue, subprocess, shutil, os, urllib.parse, requests
 
 # ===========================
 # ПАРАМЕТРЫ СЪЁМКИ И ПАПКИ
@@ -39,7 +39,7 @@ def blink(led, times=2, ms=120):
         led.on(); sleep(ms/1000); led.off(); sleep(ms/1000)
 
 # ===========================
-# MINIO (дефолты взяты из твоего Java application.yml)
+# MINIO (дефолты как в Java)
 # Можно переопределять через ENV
 # ===========================
 def _parse_wh(s: str, default=(384,384)):
@@ -55,12 +55,11 @@ def _parse_wh(s: str, default=(384,384)):
 # minio.storage.password: minioadmin
 # minio.photosBucket:     photo
 # minio.thumbsBucket:     thumbs
-# (coordinationBucket есть, но мы его здесь не используем)
+# coordinationBucket:     coordination
 MINIO_ENDPOINT_RAW = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
 MINIO_ACCESS_KEY   = os.getenv("MINIO_ACCESS_KEY", os.getenv("MINIO_LOGIN", "minioadmin"))
 MINIO_SECRET_KEY   = os.getenv("MINIO_SECRET_KEY", os.getenv("MINIO_PASSWORD", "minioadmin"))
 
-# если в ENDPOINT указан протокол — возьмём secure из него
 def _normalize_endpoint(ep_raw: str):
     try:
         if ep_raw.startswith("http://") or ep_raw.startswith("https://"):
@@ -70,16 +69,14 @@ def _normalize_endpoint(ep_raw: str):
             return hostport, secure
     except Exception:
         pass
-    # иначе читаем флаг из ENV, по умолчанию false
     return ep_raw, os.getenv("MINIO_SECURE", "false").lower() == "true"
 
 MINIO_ENDPOINT, MINIO_SECURE = _normalize_endpoint(MINIO_ENDPOINT_RAW)
 
 # бакеты по умолчанию как в Java
-MINIO_PHOTOS_BUCKET = os.getenv("MINIO_PHOTOS_BUCKET", "photo")
-MINIO_THUMBS_BUCKET = os.getenv("MINIO_THUMBS_BUCKET", "thumbs")
-# метки YOLO складываем рядом с фото
-MINIO_LABELS_BUCKET = os.getenv("MINIO_LABELS_BUCKET", MINIO_PHOTOS_BUCKET)
+MINIO_PHOTOS_BUCKET       = os.getenv("MINIO_PHOTOS_BUCKET", "photo")
+MINIO_THUMBS_BUCKET       = os.getenv("MINIO_THUMBS_BUCKET", "thumbs")
+MINIO_COORDINATION_BUCKET = os.getenv("MINIO_COORDINATION_BUCKET", "coordination")
 
 # общий префикс ключей (обычно пусто при раздельных бакетах)
 MINIO_PREFIX = os.getenv("MINIO_PREFIX", "").strip().strip("/")
@@ -101,17 +98,16 @@ def _init_minio():
             secure=MINIO_SECURE
         )
         # проверить/создать бакеты
-        for bucket in {MINIO_PHOTOS_BUCKET, MINIO_THUMBS_BUCKET, MINIO_LABELS_BUCKET}:
+        for bucket in {MINIO_PHOTOS_BUCKET, MINIO_THUMBS_BUCKET, MINIO_COORDINATION_BUCKET}:
             try:
                 if not _minio_client.bucket_exists(bucket):
                     _minio_client.make_bucket(bucket)
                     print(f"[minio] created bucket '{bucket}'")
             except Exception as e:
-                # если гонка или нет прав — залогируем и поедем дальше
                 print(f"[minio] bucket '{bucket}' check/create: {e}")
         _minio_ok = True
         print(f"[minio] endpoint={MINIO_ENDPOINT} secure={MINIO_SECURE} | "
-              f"photosBucket={MINIO_PHOTOS_BUCKET} thumbsBucket={MINIO_THUMBS_BUCKET} labelsBucket={MINIO_LABELS_BUCKET}")
+              f"photosBucket={MINIO_PHOTOS_BUCKET} thumbsBucket={MINIO_THUMBS_BUCKET} coordinationBucket={MINIO_COORDINATION_BUCKET}")
     except Exception as e:
         _minio_ok = False
         print(f"[minio] init error: {e}")
@@ -273,10 +269,12 @@ def capture_with_camera(dst_path: Path, rotation=0):
             else:
                 raise
 
-def _save_and_upload(final_path: Path, is_cat: bool, best_conf: float, yolo_lines: list[str], ts_iso: str):
+def _save_and_upload(final_path: Path, is_cat: bool, best_conf: float, yolo_lines, ts_iso: str):
     """
-    Делает миниатюру, сохраняет .txt метки (если есть) и заливает всё в MinIO в бакеты,
-    совпадающие с Java: photo (фото+метки), thumbs (миниатюры).
+    Делает миниатюру, сохраняет .txt метки (если есть) и заливает всё в MinIO в бакеты:
+    - photo: оригиналы
+    - thumbs: миниатюры
+    - coordination: yolo .txt (basename)
     """
     # 1) миниатюра
     thumb_path = final_path.with_name(final_path.stem + "_thumb.jpg")
@@ -298,13 +296,14 @@ def _save_and_upload(final_path: Path, is_cat: bool, best_conf: float, yolo_line
         return
 
     split = "cats" if is_cat else "not_cat"
-    # структура ключей согласована для Java-проекта
+    # раздельные бакеты → без верхних 'photos/' и 'thumbs/' в ключах
     date = datetime.fromisoformat(ts_iso.replace("Z","")).date()
     y = f"{date.year:04d}"; m = f"{date.month:02d}"; d = f"{date.day:02d}"
 
-    photo_key  = _minio_key("photos", split, y, m, d, final_path.name)
-    thumb_key  = _minio_key("thumbs", split, y, m, d, thumb_path.name)
-    labels_key = _minio_key("labels", split, y, m, d, labels_path.name) if labels_path else None
+    photo_key = _minio_key(split, y, m, d, final_path.name)
+    thumb_key = _minio_key(split, y, m, d, thumb_path.name)
+    # coordination.txt кладём в отдельный бакет с базовым именем
+    coord_key = (final_path.stem + ".txt") if labels_path else None
 
     meta = {
         "is_cat": str(is_cat).lower(),
@@ -316,8 +315,8 @@ def _save_and_upload(final_path: Path, is_cat: bool, best_conf: float, yolo_line
     _upload_file(final_path, MINIO_PHOTOS_BUCKET, photo_key, content_type="image/jpeg", metadata=meta)
     if thumb_path.exists():
         _upload_file(thumb_path, MINIO_THUMBS_BUCKET, thumb_key, content_type="image/jpeg", metadata=meta)
-    if labels_key and labels_path and Path(labels_path).exists():
-        _upload_file(labels_path, MINIO_LABELS_BUCKET, labels_key, content_type="text/plain", metadata=meta)
+    if coord_key and labels_path and labels_path.exists():
+        _upload_file(labels_path, MINIO_COORDINATION_BUCKET, coord_key, content_type="text/plain", metadata=meta)
 
 def worker():
     while True:
@@ -341,6 +340,24 @@ def worker():
                 print(f"[save] -> {dst}")
                 blink(green_led, times=3)
                 _save_and_upload(dst, True, best, yolo_lines, ts_iso)
+
+                # регистрация в Java
+                now_local = datetime.now().astimezone()
+                creation_dt_iso = now_local.isoformat(timespec="seconds")   # "2025-10-04T12:15:30+05:30"
+                creation_date_str = now_local.date().isoformat()            # "2025-10-04"
+                title = dst.name
+                ext = (dst.suffix.lstrip(".") or "jpg").lower()
+                coord_name = dst.with_suffix(".txt").name if yolo_lines else None
+                coord_dt_iso = creation_dt_iso if coord_name else None
+                register_photo_in_java(
+                    title=title,
+                    ext=ext,
+                    creation_dt_iso=creation_dt_iso,
+                    creation_date_str=creation_date_str,
+                    coordination_path=coord_name,
+                    coordination_dt_iso=coord_dt_iso
+                )
+
             else:
                 dst = NOT_CAT_DIR / f"not_cat_{ts}.jpg"
                 shutil.move(str(tmp_path), str(dst))
@@ -348,11 +365,69 @@ def worker():
                 blink(red_led, times=3)
                 _save_and_upload(dst, False, 0.0, [], ts_iso)
 
+                # регистрация в Java (без coordination)
+                now_local = datetime.now().astimezone()
+                creation_dt_iso = now_local.isoformat(timespec="seconds")
+                creation_date_str = now_local.date().isoformat()
+                title = dst.name
+                ext = (dst.suffix.lstrip(".") or "jpg").lower()
+                register_photo_in_java(
+                    title=title,
+                    ext=ext,
+                    creation_dt_iso=creation_dt_iso,
+                    creation_date_str=creation_date_str,
+                    coordination_path=None,
+                    coordination_dt_iso=None
+                )
+
         except Exception as e:
             print(f"[err] {e}")
         finally:
             blue_led.off()
             work_q.task_done()
+
+# Куда слать регистрацию
+JAVA_API_BASE = os.getenv("JAVA_API_BASE", "http://localhost:8080")  # можно IP Pi или ssh-туннель
+
+def register_photo_in_java(
+    title: str,
+    ext: str,
+    creation_dt_iso: str,
+    creation_date_str: str,
+    coordination_path: str | None,
+    coordination_dt_iso: str | None,
+    timeout_sec: float = 3.0,
+):
+    """
+    Шлёт в Java:
+    {
+      "title": "...",
+      "ext": "jpg",
+      "creationDateTime": "...",   # ISO с временной зоной
+      "creationDate": "YYYY-MM-DD",
+      "coordination": { "path": "...", "creationDate": "..." }  # можно None
+    }
+    """
+    payload = {
+        "title": title,
+        "ext": ext,
+        "creationDateTime": creation_dt_iso,
+        "creationDate": creation_date_str,
+        "coordination": None
+    }
+    if coordination_path and coordination_dt_iso:
+        payload["coordination"] = {
+            "path": coordination_path,
+            "creationDate": coordination_dt_iso
+        }
+
+    try:
+        r = requests.post(f"{JAVA_API_BASE}/api/register", json=payload, timeout=timeout_sec)
+        print(f"[java] register status={r.status_code}")
+        if r.status_code >= 300:
+            print(f"[java] body: {r.text[:500]}")
+    except Exception as e:
+        print(f"[java] register error: {e}")
 
 # ===========================
 # STARTUP
