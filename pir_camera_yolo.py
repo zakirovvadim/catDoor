@@ -18,9 +18,9 @@ TMP_DIR = BASE_DIR / "tmp"
 CATS_DIR = BASE_DIR / "cats"
 NOT_CAT_DIR = BASE_DIR / "not_cat"
 
-COOLDOWN_SEC = 5
-WARMUP_PIR_SEC = 30
-PHOTO_RES = "1536x864"       # ширина x высота
+COOLDOWN_SEC = 1
+WARMUP_PIR_SEC = 10
+PHOTO_RES = "4608×2592"       # ширина x высота
 CAPTURE_RETRIES = 2          # сколько раз повторять, если libcamera вернул ошибку
 RETRY_DELAY = 0.4            # пауза между повторами
 
