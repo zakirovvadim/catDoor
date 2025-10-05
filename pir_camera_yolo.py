@@ -7,6 +7,7 @@ from time import sleep, monotonic
 from datetime import datetime, timezone
 from pathlib import Path
 import threading, queue, subprocess, shutil, os, urllib.parse
+import re
 
 # ===========================
 # ПАРАМЕТРЫ СЪЁМКИ И ПАПКИ
@@ -20,9 +21,9 @@ NOT_CAT_DIR = BASE_DIR / "not_cat"
 
 COOLDOWN_SEC = 1
 WARMUP_PIR_SEC = 10
-PHOTO_RES = "4608x2592"       # ширина x высота
-CAPTURE_RETRIES = 2          # сколько раз повторять, если libcamera вернул ошибку
-RETRY_DELAY = 0.4            # пауза между повторами
+PHOTO_RES = "4608x2592"   # ширина x высота (поддерживает '×')
+CAPTURE_RETRIES = 2
+RETRY_DELAY = 0.4
 
 for d in [BASE_DIR, TMP_DIR, CATS_DIR, NOT_CAT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
@@ -40,29 +41,23 @@ def blink(led, times=2, ms=120):
 
 # ===========================
 # MINIO (дефолты как в Java)
-# Можно переопределять через ENV
 # ===========================
 def _parse_wh(s: str, default=(384,384)):
     try:
-        w,h = s.lower().split("x")
-        return (int(w), int(h))
+        s = s.strip().lower().replace("×", "x")
+        m = re.fullmatch(r"\s*(\d+)\s*x\s*(\d+)\s*", s)
+        if not m: return default
+        return (int(m.group(1)), int(m.group(2)))
     except Exception:
         return default
 
-# из Java:
-# minio.storage.endpoint: http://localhost:9000
-# minio.storage.login:    minioadmin
-# minio.storage.password: minioadmin
-# minio.photosBucket:     photo
-# minio.thumbsBucket:     thumbs
-# coordinationBucket:     coordination
 MINIO_ENDPOINT_RAW = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
 MINIO_ACCESS_KEY   = os.getenv("MINIO_ACCESS_KEY", os.getenv("MINIO_LOGIN", "minioadmin"))
 MINIO_SECRET_KEY   = os.getenv("MINIO_SECRET_KEY", os.getenv("MINIO_PASSWORD", "minioadmin"))
 
 def _normalize_endpoint(ep_raw: str):
     try:
-        if ep_raw.startswith("http://") or ep_raw.startswith("https://"):
+        if ep_raw.startswith(("http://","https://")):
             u = urllib.parse.urlparse(ep_raw)
             hostport = u.netloc or u.path
             secure = (u.scheme == "https")
@@ -73,15 +68,10 @@ def _normalize_endpoint(ep_raw: str):
 
 MINIO_ENDPOINT, MINIO_SECURE = _normalize_endpoint(MINIO_ENDPOINT_RAW)
 
-# бакеты по умолчанию как в Java
 MINIO_PHOTOS_BUCKET       = os.getenv("MINIO_PHOTOS_BUCKET", "photo")
 MINIO_THUMBS_BUCKET       = os.getenv("MINIO_THUMBS_BUCKET", "thumbs")
 MINIO_COORDINATION_BUCKET = os.getenv("MINIO_COORDINATION_BUCKET", "coordination")
-
-# общий префикс ключей (обычно пусто при раздельных бакетах)
 MINIO_PREFIX = os.getenv("MINIO_PREFIX", "").strip().strip("/")
-
-# размер миниатюры (максимум по большей стороне)
 THUMB_SIZE = _parse_wh(os.getenv("THUMB_SIZE", "384x384"), (384,384))
 
 _minio_client = None
@@ -97,7 +87,6 @@ def _init_minio():
             secret_key=MINIO_SECRET_KEY,
             secure=MINIO_SECURE
         )
-        # проверить/создать бакеты
         for bucket in {MINIO_PHOTOS_BUCKET, MINIO_THUMBS_BUCKET, MINIO_COORDINATION_BUCKET}:
             try:
                 if not _minio_client.bucket_exists(bucket):
@@ -125,6 +114,7 @@ def _upload_file(local_path: Path, bucket: str, key: str,
         return False
     try:
         extra = {f"x-amz-meta-{k}": str(v) for k, v in (metadata or {}).items()}
+        print(f"[minio] put -> bucket={bucket}, key={key}, file={local_path}")
         _minio_client.fput_object(
             bucket, key, str(local_path),
             content_type=content_type,
@@ -153,16 +143,16 @@ def _make_thumbnail(src: Path, dst: Path, max_wh=(384,384)):
         return False
 
 # ===========================
-# YOLOv4-tiny (OpenCV DNN)
+# ДЕТЕКТ: YOLOv4-tiny (OpenCV DNN)
 # ===========================
 import cv2, numpy as np
+
 YOLO_CFG     = str(Path.home() / "models/yolo-tiny/yolov4-tiny.cfg")
 YOLO_WEIGHTS = str(Path.home() / "models/yolo-tiny/yolov4-tiny.weights")
 CONF_THRES = 0.25
 NMS_THRES  = 0.45
 INPUT_SIZE = 416
 CAT_CLASS_ID = 15            # COCO: 15 == "cat"
-
 _layer_names = None
 _out_layers = None
 net = None
@@ -174,7 +164,6 @@ def _yolo_init():
     net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
     _layer_names = net.getLayerNames()
     _out_layers = [_layer_names[i - 1] for i in np.atleast_1d(net.getUnconnectedOutLayers()).flatten()]
-    # разогрев
     _warm = cv2.dnn.blobFromImage(np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8),
                                   1/255.0, (INPUT_SIZE, INPUT_SIZE), swapRB=True, crop=False)
     net.setInput(_warm)
@@ -207,9 +196,15 @@ def detect_is_cat_cv(img_path: str):
                 confs.append(conf)
                 class_ids.append(cid)
 
+    # NMS
+    indices = cv2.dnn.NMSBoxes(boxes, confs, CONF_THRES, NMS_THRES)
+    keep = set(int(i) for i in np.atleast_1d(indices).flatten()) if len(indices) else set()
+
     best_cat = 0.0
     yolo_lines = []
     for i in range(len(boxes)):
+        if i not in keep:
+            continue
         if class_ids[i] == CAT_CLASS_ID:
             best_cat = max(best_cat, confs[i])
             x, y, ww, hh = boxes[i]
@@ -219,7 +214,46 @@ def detect_is_cat_cv(img_path: str):
             norm_h   = hh / h
             yolo_lines.append(f"{CAT_CLASS_ID} {x_center:.6f} {y_center:.6f} {norm_w:.6f} {norm_h:.6f}")
 
-    print(f"[yolo] cat_conf={best_cat:.2f}, boxes={len(boxes)}")
+    print(f"[yolo] cat_conf={best_cat:.2f}, boxes={len(keep)}")
+    return (best_cat > 0.0, best_cat, yolo_lines)
+
+# ===========================
+# ДЕТЕКТ: YOLOv8n (Ultralytics) — опционально
+# ===========================
+USE_YOLOV8 = True  # True=использовать v8n, False=оставить v4-tiny
+_y8_model = None
+try:
+    from ultralytics import YOLO  # pip install ultralytics
+except Exception:
+    USE_YOLOV8 = False
+
+def _yolo8_init():
+    global _y8_model
+    if _y8_model is None:
+        _y8_model = YOLO("yolov8n.pt")   # скачается при первом запуске
+
+def detect_is_cat_v8(img_path: str):
+    """
+    Возвращает (is_cat: bool, best_conf: float, yolo_lines: list[str])
+    yolo_lines — в формате YOLO txt, чтобы пайплайн не менять.
+    """
+    r = _y8_model.predict(source=img_path, imgsz=640, conf=0.20, iou=0.45, verbose=False)[0]
+    best_cat = 0.0
+    yolo_lines = []
+    h, w = r.orig_shape
+    if getattr(r, "boxes", None):
+        for b in r.boxes:
+            cid = int(b.cls.item())
+            conf = float(b.conf.item())
+            x1, y1, x2, y2 = map(float, b.xyxy[0].tolist())
+            if cid == 15:  # COCO 'cat'
+                best_cat = max(best_cat, conf)
+                x_c = ((x1 + x2) / 2) / w
+                y_c = ((y1 + y2) / 2) / h
+                ww  = (x2 - x1) / w
+                hh  = (y2 - y1) / h
+                yolo_lines.append(f"15 {x_c:.6f} {y_c:.6f} {ww:.6f} {hh:.6f}")
+    print(f"[yolo8] cat_conf={best_cat:.2f}, boxes={len(getattr(r,'boxes',[]))}")
     return (best_cat > 0.0, best_cat, yolo_lines)
 
 # ===========================
@@ -241,6 +275,15 @@ def enqueue_motion():
     except queue.Full:
         pass
 
+def _parse_res(s: str):
+    if not isinstance(s, str):
+        raise ValueError(f"PHOTO_RES должен быть строкой, а не {type(s)}")
+    s = s.strip().lower().replace("×", "x")
+    m = re.fullmatch(r"\s*(\d+)\s*x\s*(\d+)\s*", s)
+    if not m:
+        raise ValueError(f"Неверный PHOTO_RES='{s}', ожидаю 'WIDTHxHEIGHT', напр. '4608x2592'")
+    return int(m.group(1)), int(m.group(2))
+
 def capture_with_camera(dst_path: Path, rotation=0):
     """
     rpicam-still -> libcamera-still -> libcamera-jpeg
@@ -254,8 +297,8 @@ def capture_with_camera(dst_path: Path, rotation=0):
         raise FileNotFoundError("Нет rpicam-still/libcamera-still/libcamera-jpeg. "
                                 "Установи: sudo apt install -y rpicam-apps || libcamera-apps")
 
-    w, h = PHOTO_RES.split("x")
-    args = [cmd, "-n", "--immediate", "--width", w, "--height", h, "-o", str(dst_path)]
+    w, h = _parse_res(PHOTO_RES)
+    args = [cmd, "-n", "--immediate", "--width", str(w), "--height", str(h), "-o", str(dst_path)]
     if rotation:
         args[1:1] = ["--rotation", str(rotation)]
 
@@ -271,16 +314,14 @@ def capture_with_camera(dst_path: Path, rotation=0):
 
 def _save_and_upload(final_path: Path, is_cat: bool, best_conf: float, yolo_lines, ts_iso: str):
     """
-    Делает миниатюру, сохраняет .txt метки (если есть) и заливает всё в MinIO в бакеты:
+    Делает миниатюру, сохраняет .txt метки (если есть) и заливает в MinIO:
     - photo: оригиналы
     - thumbs: миниатюры
     - coordination: yolo .txt (basename)
     """
-    # 1) миниатюра
     thumb_path = final_path.with_name(final_path.stem + "_thumb.jpg")
     _make_thumbnail(final_path, thumb_path, THUMB_SIZE)
 
-    # 2) YOLO labels .txt (если есть)
     labels_path = None
     if yolo_lines:
         labels_path = final_path.with_suffix(".txt")
@@ -293,16 +334,15 @@ def _save_and_upload(final_path: Path, is_cat: bool, best_conf: float, yolo_line
             labels_path = None
 
     if not _minio_ok:
+        print("[minio] OFF: загрузка только на локальный диск")
         return
 
     split = "cats" if is_cat else "not_cat"
-    # раздельные бакеты → без верхних 'photos/' и 'thumbs/' в ключах
     date = datetime.fromisoformat(ts_iso.replace("Z","")).date()
     y = f"{date.year:04d}"; m = f"{date.month:02d}"; d = f"{date.day:02d}"
 
     photo_key = _minio_key(split, y, m, d, final_path.name)
     thumb_key = _minio_key(split, y, m, d, thumb_path.name)
-    # coordination.txt кладём в отдельный бакет с базовым именем
     coord_key = (final_path.stem + ".txt") if labels_path else None
 
     meta = {
@@ -331,7 +371,10 @@ def worker():
             capture_with_camera(tmp_path)
             print(f"[shot] saved: {tmp_path}")
 
-            is_cat, best, yolo_lines = detect_is_cat_cv(str(tmp_path))
+            if USE_YOLOV8:
+                is_cat, best, yolo_lines = detect_is_cat_v8(str(tmp_path))
+            else:
+                is_cat, best, yolo_lines = detect_is_cat_cv(str(tmp_path))
             blue_led.off()
 
             if is_cat:
@@ -351,6 +394,7 @@ def worker():
         finally:
             blue_led.off()
             work_q.task_done()
+
 # ===========================
 # STARTUP
 # ===========================
@@ -358,7 +402,16 @@ print(f"[init] прогрев PIR ~{WARMUP_PIR_SEC}s…")
 sleep(WARMUP_PIR_SEC)
 
 # Инициализация YOLO и MinIO
-_yolo_init()
+try:
+    if USE_YOLOV8:
+        _yolo8_init()
+    else:
+        _yolo_init()
+except Exception as e:
+    print(f"[yolo] init error: {e} — переключаюсь на YOLOv4-tiny")
+    USE_YOLOV8 = False
+    _yolo_init()
+
 _init_minio()
 
 threading.Thread(target=worker, daemon=True).start()
@@ -366,5 +419,6 @@ pir.when_motion = lambda: (print("[motion] движение"), enqueue_motion())
 pir.when_no_motion = lambda: print("[idle] нет движения")
 
 print(f"[run] жду движение… (cooldown={COOLDOWN_SEC}s, save dir={BASE_DIR}) | "
-      f"MinIO: {MINIO_ENDPOINT_RAW} -> {MINIO_ENDPOINT}, secure={MINIO_SECURE}")
+      f"PHOTO_RES={PHOTO_RES} | MinIO: {MINIO_ENDPOINT_RAW} -> {MINIO_ENDPOINT}, secure={MINIO_SECURE} | "
+      f"detector={'YOLOv8n' if USE_YOLOV8 else 'YOLOv4-tiny'}")
 pause()
