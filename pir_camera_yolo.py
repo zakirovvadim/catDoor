@@ -149,7 +149,7 @@ import cv2, numpy as np
 
 # ---- YOLOv8n ONNX (через OpenCV DNN) ----
 DETECTOR = os.getenv("DETECTOR", "v8-onnx").strip().lower()  # v8-onnx | v4-tiny
-V8_ONNX_PATH = os.getenv("V8_ONNX", str(Path.home() / "models/yolov8n.onnx"))
+V8_ONNX_PATH = os.path.expanduser(os.getenv("V8_ONNX", str(Path.home() / "models/yolov8n.onnx")))
 V8_INPUT = int(os.getenv("V8_INPUT", "640"))
 V8_CONF_THRES = float(os.getenv("V8_CONF_THRES", "0.25"))
 V8_IOU_THRES  = float(os.getenv("V8_IOU_THRES", "0.45"))
