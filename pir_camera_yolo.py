@@ -143,42 +143,156 @@ def _make_thumbnail(src: Path, dst: Path, max_wh=(384,384)):
         return False
 
 # ===========================
-# ДЕТЕКТ: YOLOv4-tiny (OpenCV DNN)
+# ДЕТЕКТОРЫ
 # ===========================
 import cv2, numpy as np
 
-YOLO_CFG     = str(Path.home() / "models/yolo-tiny/yolov4-tiny.cfg")
-YOLO_WEIGHTS = str(Path.home() / "models/yolo-tiny/yolov4-tiny.weights")
-CONF_THRES = 0.25
-NMS_THRES  = 0.45
-INPUT_SIZE = 416
-CAT_CLASS_ID = 15            # COCO: 15 == "cat"
-_layer_names = None
-_out_layers = None
-net = None
+# ---- YOLOv8n ONNX (через OpenCV DNN) ----
+DETECTOR = os.getenv("DETECTOR", "v8-onnx").strip().lower()  # v8-onnx | v4-tiny
+V8_ONNX_PATH = os.getenv("V8_ONNX", str(Path.home() / "models/yolov8n.onnx"))
+V8_INPUT = int(os.getenv("V8_INPUT", "640"))
+V8_CONF_THRES = float(os.getenv("V8_CONF_THRES", "0.25"))
+V8_IOU_THRES  = float(os.getenv("V8_IOU_THRES", "0.45"))
+CAT_CLASS_ID = 15  # COCO 'cat'
 
-def _yolo_init():
-    global _layer_names, _out_layers, net
-    net = cv2.dnn.readNetFromDarknet(YOLO_CFG, YOLO_WEIGHTS)
-    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-    _layer_names = net.getLayerNames()
-    _out_layers = [_layer_names[i - 1] for i in np.atleast_1d(net.getUnconnectedOutLayers()).flatten()]
-    _warm = cv2.dnn.blobFromImage(np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8),
-                                  1/255.0, (INPUT_SIZE, INPUT_SIZE), swapRB=True, crop=False)
-    net.setInput(_warm)
-    _ = net.forward(_out_layers)
+_net_v8 = None
+def _v8_onnx_init():
+    global _net_v8
+    _net_v8 = cv2.dnn.readNetFromONNX(V8_ONNX_PATH)
+    _net_v8.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+    _net_v8.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+    # прогрев
+    dummy = np.zeros((V8_INPUT, V8_INPUT, 3), dtype=np.uint8)
+    blob = cv2.dnn.blobFromImage(dummy, 1/255.0, (V8_INPUT, V8_INPUT), swapRB=True, crop=False)
+    _net_v8.setInput(blob)
+    _ = _net_v8.forward()
 
-def detect_is_cat_cv(img_path: str):
+def _v8_parse_output(out, img_w, img_h):
+    """
+    Универсальный парсер под два популярных формата экспорта Ultralytics:
+    1) (1, 84, N)  -> транспонируем до (N,84)
+    2) (1, N, 84)  -> вытаскиваем (N,84)
+    Каждая строка: [x, y, w, h, obj, cls0..cls79] в относительных координатах.
+    Возвращает списки boxes(x,y,w,h в пикселях), scores(=obj*cls), class_ids.
+    """
+    arr = out
+    if isinstance(arr, (list, tuple)):
+        arr = arr[0]
+    arr = np.array(arr)
+    # squeeze до 3D
+    arr = np.squeeze(arr)
+    # приведение к (N, 84)
+    if arr.ndim == 2:
+        if arr.shape[0] == 84:          # (84, N) -> (N,84)
+            arr = arr.transpose(1, 0)
+        elif arr.shape[1] == 84:        # (N,84) ок
+            pass
+        else:
+            raise RuntimeError(f"Unexpected YOLOv8 ONNX output shape {arr.shape}")
+    else:
+        raise RuntimeError(f"Unexpected YOLOv8 ONNX output ndim={arr.ndim}, shape={arr.shape}")
+
+    xywh = arr[:, :4]
+    obj  = arr[:, 4:5]
+    cls  = arr[:, 5:]                   # (N, 80)
+
+    # лучший класс и его вероятность
+    cls_ids = np.argmax(cls, axis=1)
+    cls_scores = cls[np.arange(cls.shape[0]), cls_ids]
+    scores = (cls_scores * obj[:, 0])   # принятой формулой: conf = obj * cls_conf
+
+    # фильтр уверенности
+    keep = scores > V8_CONF_THRES
+    if not np.any(keep):
+        return [], [], []
+
+    xywh = xywh[keep]; scores = scores[keep]; cls_ids = cls_ids[keep]
+
+    # перевод в xyxy (в пикселях)
+    x = xywh[:, 0] * img_w
+    y = xywh[:, 1] * img_h
+    w = xywh[:, 2] * img_w
+    h = xywh[:, 3] * img_h
+    x1 = x - w / 2
+    y1 = y - h / 2
+    x2 = x + w / 2
+    y2 = y + h / 2
+
+    boxes = np.stack([x1, y1, x2 - x1, y2 - y1], axis=1).astype(np.float32)  # x,y,w,h
+    return boxes.tolist(), scores.tolist(), cls_ids.tolist()
+
+def detect_is_cat_v8_onnx(img_path: str):
     img = cv2.imread(img_path)
     if img is None:
-        print("[yolo] cv2.imread вернул None")
+        print("[v8-onnx] cv2.imread None")
+        return (False, 0.0, [])
+    h, w = img.shape[:2]
+    blob = cv2.dnn.blobFromImage(img, 1/255.0, (V8_INPUT, V8_INPUT), swapRB=True, crop=False)
+    _net_v8.setInput(blob)
+    out = _net_v8.forward()
+    try:
+        boxes, scores, class_ids = _v8_parse_output(out, w, h)
+    except Exception as e:
+        print(f"[v8-onnx] parse error: {e}")
+        return (False, 0.0, [])
+
+    # NMS по всем классам
+    if boxes:
+        idxs = cv2.dnn.NMSBoxes(boxes, scores, V8_CONF_THRES, V8_IOU_THRES)
+        keep = set(int(i) for i in np.atleast_1d(idxs).flatten()) if len(idxs) else set()
+    else:
+        keep = set()
+
+    best_cat = 0.0
+    yolo_lines = []
+    for i in range(len(boxes)):
+        if i not in keep:
+            continue
+        if class_ids[i] == CAT_CLASS_ID:
+            conf = float(scores[i])
+            best_cat = max(best_cat, conf)
+            x, y, ww, hh = boxes[i]
+            # в YOLO txt нужно нормализовать (cx, cy, w, h)
+            x_center = (x + ww / 2) / w
+            y_center = (y + hh / 2) / h
+            norm_w   = ww / w
+            norm_h   = hh / h
+            yolo_lines.append(f"{CAT_CLASS_ID} {x_center:.6f} {y_center:.6f} {norm_w:.6f} {norm_h:.6f}")
+
+    print(f"[v8-onnx] cat_conf={best_cat:.2f}, boxes={len(keep)}")
+    return (best_cat > 0.0, best_cat, yolo_lines)
+
+# ---- YOLOv4-tiny (резервный) ----
+YOLO_CFG     = str(Path.home() / "models/yolo-tiny/yolov4-tiny.cfg")
+YOLO_WEIGHTS = str(Path.home() / "models/yolo-tiny/yolov4-tiny.weights")
+CONF_THRES_TINY = 0.25
+NMS_THRES_TINY  = 0.45
+INPUT_SIZE_TINY = 416
+_layer_names = None
+_out_layers = None
+_net_tiny = None
+
+def _yolo_tiny_init():
+    global _layer_names, _out_layers, _net_tiny
+    _net_tiny = cv2.dnn.readNetFromDarknet(YOLO_CFG, YOLO_WEIGHTS)
+    _net_tiny.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+    _net_tiny.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+    _layer_names = _net_tiny.getLayerNames()
+    _out_layers = [_layer_names[i - 1] for i in np.atleast_1d(_net_tiny.getUnconnectedOutLayers()).flatten()]
+    _warm = cv2.dnn.blobFromImage(np.zeros((INPUT_SIZE_TINY, INPUT_SIZE_TINY, 3), dtype=np.uint8),
+                                  1/255.0, (INPUT_SIZE_TINY, INPUT_SIZE_TINY), swapRB=True, crop=False)
+    _net_tiny.setInput(_warm); _ = _net_tiny.forward(_out_layers)
+
+def detect_is_cat_tiny(img_path: str):
+    img = cv2.imread(img_path)
+    if img is None:
+        print("[tiny] cv2.imread вернул None")
         return (False, 0.0, [])
 
     h, w = img.shape[:2]
-    blob = cv2.dnn.blobFromImage(img, 1/255.0, (INPUT_SIZE, INPUT_SIZE), swapRB=True, crop=False)
-    net.setInput(blob)
-    outs = net.forward(_out_layers)
+    blob = cv2.dnn.blobFromImage(img, 1/255.0, (INPUT_SIZE_TINY, INPUT_SIZE_TINY), swapRB=True, crop=False)
+    _net_tiny.setInput(blob)
+    outs = _net_tiny.forward(_out_layers)
 
     boxes, confs, class_ids = [], [], []
     for out in outs:
@@ -186,7 +300,7 @@ def detect_is_cat_cv(img_path: str):
             scores = det[5:]
             cid = int(np.argmax(scores))
             conf = float(scores[cid])
-            if conf > CONF_THRES:
+            if conf > CONF_THRES_TINY:
                 cx, cy, bw, bh = det[:4]
                 bw_px = int(bw * w)
                 bh_px = int(bh * h)
@@ -196,9 +310,8 @@ def detect_is_cat_cv(img_path: str):
                 confs.append(conf)
                 class_ids.append(cid)
 
-    # NMS
-    indices = cv2.dnn.NMSBoxes(boxes, confs, CONF_THRES, NMS_THRES)
-    keep = set(int(i) for i in np.atleast_1d(indices).flatten()) if len(indices) else set()
+    idxs = cv2.dnn.NMSBoxes(boxes, confs, CONF_THRES_TINY, NMS_THRES_TINY)
+    keep = set(int(i) for i in np.atleast_1d(idxs).flatten()) if len(idxs) else set()
 
     best_cat = 0.0
     yolo_lines = []
@@ -214,46 +327,7 @@ def detect_is_cat_cv(img_path: str):
             norm_h   = hh / h
             yolo_lines.append(f"{CAT_CLASS_ID} {x_center:.6f} {y_center:.6f} {norm_w:.6f} {norm_h:.6f}")
 
-    print(f"[yolo] cat_conf={best_cat:.2f}, boxes={len(keep)}")
-    return (best_cat > 0.0, best_cat, yolo_lines)
-
-# ===========================
-# ДЕТЕКТ: YOLOv8n (Ultralytics) — опционально
-# ===========================
-USE_YOLOV8 = True  # True=использовать v8n, False=оставить v4-tiny
-_y8_model = None
-try:
-    from ultralytics import YOLO  # pip install ultralytics
-except Exception:
-    USE_YOLOV8 = False
-
-def _yolo8_init():
-    global _y8_model
-    if _y8_model is None:
-        _y8_model = YOLO("yolov8n.pt")   # скачается при первом запуске
-
-def detect_is_cat_v8(img_path: str):
-    """
-    Возвращает (is_cat: bool, best_conf: float, yolo_lines: list[str])
-    yolo_lines — в формате YOLO txt, чтобы пайплайн не менять.
-    """
-    r = _y8_model.predict(source=img_path, imgsz=640, conf=0.20, iou=0.45, verbose=False)[0]
-    best_cat = 0.0
-    yolo_lines = []
-    h, w = r.orig_shape
-    if getattr(r, "boxes", None):
-        for b in r.boxes:
-            cid = int(b.cls.item())
-            conf = float(b.conf.item())
-            x1, y1, x2, y2 = map(float, b.xyxy[0].tolist())
-            if cid == 15:  # COCO 'cat'
-                best_cat = max(best_cat, conf)
-                x_c = ((x1 + x2) / 2) / w
-                y_c = ((y1 + y2) / 2) / h
-                ww  = (x2 - x1) / w
-                hh  = (y2 - y1) / h
-                yolo_lines.append(f"15 {x_c:.6f} {y_c:.6f} {ww:.6f} {hh:.6f}")
-    print(f"[yolo8] cat_conf={best_cat:.2f}, boxes={len(getattr(r,'boxes',[]))}")
+    print(f"[tiny] cat_conf={best_cat:.2f}, boxes={len(keep)}")
     return (best_cat > 0.0, best_cat, yolo_lines)
 
 # ===========================
@@ -371,10 +445,10 @@ def worker():
             capture_with_camera(tmp_path)
             print(f"[shot] saved: {tmp_path}")
 
-            if USE_YOLOV8:
-                is_cat, best, yolo_lines = detect_is_cat_v8(str(tmp_path))
+            if DETECTOR == "v8-onnx":
+                is_cat, best, yolo_lines = detect_is_cat_v8_onnx(str(tmp_path))
             else:
-                is_cat, best, yolo_lines = detect_is_cat_cv(str(tmp_path))
+                is_cat, best, yolo_lines = detect_is_cat_tiny(str(tmp_path))
             blue_led.off()
 
             if is_cat:
@@ -401,16 +475,18 @@ def worker():
 print(f"[init] прогрев PIR ~{WARMUP_PIR_SEC}s…")
 sleep(WARMUP_PIR_SEC)
 
-# Инициализация YOLO и MinIO
+# Инициализация детектора и MinIO
 try:
-    if USE_YOLOV8:
-        _yolo8_init()
+    if DETECTOR == "v8-onnx":
+        _v8_onnx_init()
+    elif DETECTOR == "v4-tiny":
+        _yolo_tiny_init()
     else:
-        _yolo_init()
+        raise ValueError(f"Unknown DETECTOR={DETECTOR}")
 except Exception as e:
-    print(f"[yolo] init error: {e} — переключаюсь на YOLOv4-tiny")
-    USE_YOLOV8 = False
-    _yolo_init()
+    print(f"[detector] init error: {e} — fallback to YOLOv4-tiny")
+    DETECTOR = "v4-tiny"
+    _yolo_tiny_init()
 
 _init_minio()
 
@@ -420,5 +496,5 @@ pir.when_no_motion = lambda: print("[idle] нет движения")
 
 print(f"[run] жду движение… (cooldown={COOLDOWN_SEC}s, save dir={BASE_DIR}) | "
       f"PHOTO_RES={PHOTO_RES} | MinIO: {MINIO_ENDPOINT_RAW} -> {MINIO_ENDPOINT}, secure={MINIO_SECURE} | "
-      f"detector={'YOLOv8n' if USE_YOLOV8 else 'YOLOv4-tiny'}")
+      f"detector={'YOLOv8n-ONNX' if DETECTOR=='v8-onnx' else 'YOLOv4-tiny'}")
 pause()
