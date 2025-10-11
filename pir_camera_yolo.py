@@ -8,6 +8,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 import threading, queue, subprocess, shutil, os, urllib.parse
 import re
+from ultralytics import YOLO
+
+model = YOLO("/home/vgzakirov/models/yolov8n.pt")
 
 # ===========================
 # ПАРАМЕТРЫ СЪЁМКИ И ПАПКИ
@@ -148,11 +151,13 @@ def _make_thumbnail(src: Path, dst: Path, max_wh=(384,384)):
 import cv2, numpy as np
 
 # ---- YOLOv8n ONNX (через OpenCV DNN) ----
-DETECTOR = os.getenv("DETECTOR", "v8-onnx").strip().lower()  # v8-onnx | v4-tiny
+DETECTOR = os.getenv("DETECTOR", "v8-pt").strip().lower()
 V8_ONNX_PATH = os.path.expanduser(os.getenv("V8_ONNX", str(Path.home() / "models/yolov8n.onnx")))
 V8_INPUT = int(os.getenv("V8_INPUT", "640"))
 V8_CONF_THRES = float(os.getenv("V8_CONF_THRES", "0.25"))
 V8_IOU_THRES  = float(os.getenv("V8_IOU_THRES", "0.45"))
+V8_PT_CONF_THRES = float(os.getenv("V8_PT_CONF_THRES", "0.25"))
+V8_PT_IOU_THRES  = float(os.getenv("V8_PT_IOU_THRES", "0.45"))
 CAT_CLASS_ID = 15  # COCO 'cat'
 
 _net_v8 = None
@@ -221,6 +226,50 @@ def _v8_parse_output(out, img_w, img_h):
     boxes = np.stack([x1, y1, x2 - x1, y2 - y1], axis=1).astype(np.float32)  # x,y,w,h
     return boxes.tolist(), scores.tolist(), cls_ids.tolist()
 
+def detect_is_cat_v8_pt(img_path: str):
+    """
+    Детекция через Ultralytics YOLOv8 .pt (без ONNX/OpenCV DNN).
+    Возвращает: (is_cat: bool, best_conf: float, yolo_lines: List[str]) — формат как у остальных.
+    """
+    try:
+        # model объявлен вверху файла: model = YOLO("/home/vgzakirov/models/yolov8n.pt")
+        results = model.predict(
+            source=img_path,
+            conf=V8_PT_CONF_THRES,
+            iou=V8_PT_IOU_THRES,
+            verbose=False
+        )
+    except Exception as e:
+        print(f"[v8-pt] predict error: {e}")
+        return (False, 0.0, [])
+
+    r = results[0]
+    h, w = r.orig_shape[:2]
+    best_cat = 0.0
+    yolo_lines = []
+
+    if getattr(r, "boxes", None) is None or r.boxes is None:
+        print("[v8-pt] no boxes")
+        return (False, 0.0, [])
+
+    # xyxy, conf, cls — тензоры
+    xyxy = r.boxes.xyxy.cpu().numpy()
+    confs = r.boxes.conf.cpu().numpy()
+    clses = r.boxes.cls.cpu().numpy().astype(int)
+
+    for (x1, y1, x2, y2), conf, cid in zip(xyxy, confs, clses):
+        if cid == CAT_CLASS_ID:
+            conf = float(conf)
+            best_cat = max(best_cat, conf)
+            # нормализуем под YOLO txt (cx, cy, w, h)
+            cx = ((x1 + x2) / 2.0) / w
+            cy = ((y1 + y2) / 2.0) / h
+            ww = (x2 - x1) / w
+            hh = (y2 - y1) / h
+            yolo_lines.append(f"{CAT_CLASS_ID} {cx:.6f} {cy:.6f} {ww:.6f} {hh:.6f}")
+
+    print(f"[v8-pt] cat_conf={best_cat:.2f}, boxes={len(xyxy)}")
+    return (best_cat > 0.0, best_cat, yolo_lines)
 def detect_is_cat_v8_onnx(img_path: str):
     img = cv2.imread(img_path)
     if img is None:
@@ -445,11 +494,12 @@ def worker():
             capture_with_camera(tmp_path)
             print(f"[shot] saved: {tmp_path}")
 
-            if DETECTOR == "v8-onnx":
+            if DETECTOR == "v8-pt":
+                is_cat, best, yolo_lines = detect_is_cat_v8_pt(str(tmp_path))
+            elif DETECTOR == "v8-onnx":
                 is_cat, best, yolo_lines = detect_is_cat_v8_onnx(str(tmp_path))
             else:
                 is_cat, best, yolo_lines = detect_is_cat_tiny(str(tmp_path))
-            blue_led.off()
 
             if is_cat:
                 dst = CATS_DIR / f"cat_{ts}_{best:.2f}.jpg"
@@ -477,7 +527,9 @@ sleep(WARMUP_PIR_SEC)
 
 # Инициализация детектора и MinIO
 try:
-    if DETECTOR == "v8-onnx":
+    if DETECTOR == "v8-pt":
+        pass  # Ultralytics .pt не требует отдельной инициализации
+    elif DETECTOR == "v8-onnx":
         _v8_onnx_init()
     elif DETECTOR == "v4-tiny":
         _yolo_tiny_init()
@@ -494,7 +546,8 @@ threading.Thread(target=worker, daemon=True).start()
 pir.when_motion = lambda: (print("[motion] движение"), enqueue_motion())
 pir.when_no_motion = lambda: print("[idle] нет движения")
 
+det_name = "YOLOv8n-PT" if DETECTOR=="v8-pt" else ("YOLOv8n-ONNX" if DETECTOR=="v8-onnx" else "YOLOv4-tiny")
 print(f"[run] жду движение… (cooldown={COOLDOWN_SEC}s, save dir={BASE_DIR}) | "
       f"PHOTO_RES={PHOTO_RES} | MinIO: {MINIO_ENDPOINT_RAW} -> {MINIO_ENDPOINT}, secure={MINIO_SECURE} | "
-      f"detector={'YOLOv8n-ONNX' if DETECTOR=='v8-onnx' else 'YOLOv4-tiny'}")
+      f"detector={det_name}")
 pause()
